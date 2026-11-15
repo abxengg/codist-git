@@ -5,6 +5,7 @@ package git
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -84,11 +85,41 @@ func (r *Repo) run(args ...string) (string, error) {
 
 // Head is the commit checked out, or "" in an empty repository.
 func (r *Repo) Head() string {
+	if sha := r.headFromFiles(); sha != "" {
+		return sha
+	}
 	out, err := r.run("rev-parse", "HEAD")
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(out)
+}
+
+var fullSHA = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
+
+// headFromFiles reads HEAD from the repository's own files, which costs no git process: Head is asked once for
+// every commit reviewed. It answers "" for anything but the plain case (a .git folder, HEAD naming a branch whose
+// ref is a loose file, or HEAD holding a commit id), and the git command is asked instead.
+func (r *Repo) headFromFiles() string {
+	dir := filepath.Join(r.Root, ".git")
+	raw, err := os.ReadFile(filepath.Join(dir, "HEAD"))
+	if err != nil {
+		return ""
+	}
+	head := strings.TrimSpace(string(raw))
+	if ref, ok := strings.CutPrefix(head, "ref: "); ok {
+		if !filepath.IsLocal(filepath.FromSlash(ref)) {
+			return ""
+		}
+		if raw, err = os.ReadFile(filepath.Join(dir, filepath.FromSlash(ref))); err != nil {
+			return "" // a packed ref, or a branch with no commit yet
+		}
+		head = strings.TrimSpace(string(raw))
+	}
+	if fullSHA.MatchString(head) {
+		return head
+	}
+	return ""
 }
 
 // Branch is the checked-out branch name, or "detached".
@@ -147,10 +178,16 @@ func (r *Repo) Get(sha string) (Commit, error) {
 	if unsafe(sha) {
 		return Commit{}, errUnsafe
 	}
-	out, err := r.run("log", "-n", "1", "--format=%H"+sep+"%an"+sep+"%at"+sep+"%P"+sep+"%s"+sep+"%b"+end, sha, "--")
+	out, err := r.run("log", "-n", "1", "--format="+commitFormat, sha, "--")
 	if err != nil {
 		return Commit{}, err
 	}
+	return parseCommit(out, sha)
+}
+
+const commitFormat = "%H" + sep + "%an" + sep + "%at" + sep + "%P" + sep + "%s" + sep + "%b" + end
+
+func parseCommit(out, sha string) (Commit, error) {
 	f := strings.Split(strings.TrimSuffix(strings.TrimSpace(out), end), sep)
 	if len(f) < 6 {
 		return Commit{}, fmt.Errorf("no commit %s", sha)
@@ -160,6 +197,32 @@ func (r *Repo) Get(sha string) (Commit, error) {
 		Subject: f[4], Body: strings.TrimSpace(f[5])}, nil
 }
 
+// Show reads a commit and what it changed in one git call, for callers that need both. A merge commit's changes
+// are what the person merging wrote by hand: the difference between the merge as committed and what git makes of
+// the two sides on its own. A merge without conflicts changed nothing by hand.
+func (r *Repo) Show(sha string) (Commit, []FileChange, error) {
+	if unsafe(sha) {
+		return Commit{}, nil, errUnsafe
+	}
+	out, err := r.run("show", "--format="+commitFormat, "--no-color", "-M", "-U3", "--no-ext-diff", sha, "--")
+	if err != nil {
+		return Commit{}, nil, err
+	}
+	head, diff, _ := strings.Cut(out, end)
+	c, err := parseCommit(head, sha)
+	if err != nil {
+		return Commit{}, nil, err
+	}
+	if len(c.Parents) > 1 {
+		diff, err = r.run("show", "--format=", "--no-color", "-M", "-U3", "--no-ext-diff", "--remerge-diff", c.SHA, "--")
+		if err != nil { // a git older than 2.36 has no --remerge-diff: the merge is read as changing nothing
+			logger().Debug("merge not read", "sha", c.Short, "err", err)
+			return c, nil, nil
+		}
+	}
+	return c, parseChanges(diff), nil
+}
+
 var hunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
 
 // Changes lists what a commit changed against its first parent, or against nothing for the first commit.
@@ -167,11 +230,12 @@ func (r *Repo) Changes(sha string) ([]FileChange, error) {
 	if unsafe(sha) {
 		return nil, errUnsafe
 	}
-	args := []string{"show", "--format=", "--no-color", "-M", "-U3", "--no-ext-diff", sha}
-	out, err := r.run(args...)
-	if err != nil {
-		return nil, err
-	}
+	_, files, err := r.Show(sha)
+	return files, err
+}
+
+// parseChanges reads the output of git show or git diff into one FileChange for each file.
+func parseChanges(out string) []FileChange {
 	var files []FileChange
 	var cur *FileChange
 	var body strings.Builder
@@ -233,7 +297,7 @@ func (r *Repo) Changes(sha string) ([]FileChange, error) {
 		}
 	}
 	flush()
-	return files, nil
+	return files
 }
 
 // FileAt reads a file as it was at a commit.
